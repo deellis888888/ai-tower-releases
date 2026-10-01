@@ -1,0 +1,46 @@
+# Joins release assets uploaded in pieces (name.partNNN) back into one file, checks its sha256,
+# attaches it to the same release and removes the pieces. Used when the publishing PC's network
+# cannot carry one large upload.
+name: Stitch release pieces
+on:
+  workflow_dispatch:
+    inputs:
+      release_id: { description: "Release id (drafts included)", required: true }
+      prefix:     { description: "Piece prefix, e.g. exe.part", required: true }
+      name:       { description: "Final asset name", required: true }
+      sha256:     { description: "Expected sha256 of the joined file", required: true }
+permissions:
+  contents: write
+jobs:
+  stitch:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      ID: ${{ inputs.release_id }}
+      PREFIX: ${{ inputs.prefix }}
+      NAME: ${{ inputs.name }}
+      SHA: ${{ inputs.sha256 }}
+    steps:
+      - name: Download pieces
+        run: |
+          mkdir parts
+          gh api "repos/$REPO/releases/$ID/assets?per_page=100" --paginate \
+            -q ".[] | select(.name | startswith(env.PREFIX)) | \"\(.id) \(.name)\"" > list.txt
+          test -s list.txt
+          while read -r aid aname; do
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+              "https://api.github.com/repos/$REPO/releases/assets/$aid" -o "parts/$aname"
+          done < list.txt
+          ls parts | wc -l
+      - name: Join and verify
+        run: |
+          cat $(ls parts/"$PREFIX"* | sort) > "$NAME"
+          echo "$SHA  $NAME" | sha256sum -c -
+      - name: Attach and remove pieces
+        run: |
+          old=$(gh api "repos/$REPO/releases/$ID/assets?per_page=100" --paginate -q ".[] | select(.name == env.NAME) | .id")
+          [ -z "$old" ] || gh api -X DELETE "repos/$REPO/releases/assets/$old"
+          curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+            --data-binary @"$NAME" "https://uploads.github.com/repos/$REPO/releases/$ID/assets?name=$NAME" -o /dev/null
+          while read -r aid aname; do gh api -X DELETE "repos/$REPO/releases/assets/$aid"; done < list.txt
